@@ -3,6 +3,7 @@
 BUG FIXES:
  * core: Fix search endpoint forwarding for multi-region clusters [[GH-3680](https://github.com/hashicorp/nomad/issues/3680)]
  * config: Revert minimum CPU limit back to 20 from 100.
+ * discovery: Fix handling of `service.check_restart` [[GH-3718](https://github.com/hashicorp/nomad/issues/3718)]
 
 ## 0.7.1 (December 19, 2017)
 

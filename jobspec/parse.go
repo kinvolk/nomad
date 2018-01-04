@@ -912,6 +912,7 @@ func parseServices(jobName string, taskGroupName string, task *api.Task, service
 			"port",
 			"check",
 			"address_mode",
+			"check_restart",
 		}
 		if err := helper.CheckHCLKeys(o.Val, valid); err != nil {
 			return multierror.Prefix(err, fmt.Sprintf("service (%d) ->", idx))
@@ -1042,7 +1043,7 @@ func parseChecks(service *api.Service, checkObjs *ast.ObjectList) error {
 		if ot, ok := co.Val.(*ast.ObjectType); ok {
 			checkRestartList = ot.List
 		} else {
-			return fmt.Errorf("check_restart '%s': should be an object", check.Name)
+			return fmt.Errorf("check '%s': should be an object", check.Name)
 		}
 
 		if cro := checkRestartList.Filter("check_restart"); len(cro.Items) > 0 {
