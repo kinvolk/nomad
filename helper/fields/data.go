@@ -18,7 +18,20 @@ type FieldData struct {
 func (d *FieldData) Validate() error {
 	var result *multierror.Error
 
-	// Scan for missing required fields
+	// Check that either image or pod_manifest was passed.
+	_, podManifestExists := d.Raw["pod_manifest"]
+	_, imageExists := d.Raw["image"]
+
+	if !podManifestExists && !imageExists {
+		result = multierror.Append(result, fmt.Errorf(
+			"both field pod_manifest and image are missing, but only one is required",
+		))
+	} else if podManifestExists && imageExists {
+		result = multierror.Append(result, fmt.Errorf(
+			`either field "pod_manifest" or "image" is required, but both were found`))
+	}
+
+	// Scan for other missing required fields
 	for field, schema := range d.Schema {
 		if schema.Required {
 			_, ok := d.Raw[field]

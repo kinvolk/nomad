@@ -21,6 +21,8 @@ import (
 	"time"
 
 	appcschema "github.com/appc/spec/schema"
+	"github.com/appc/spec/schema/lastditch"
+	appctypes "github.com/appc/spec/schema/types"
 	rktv1 "github.com/rkt/rkt/api/v1"
 
 	"github.com/hashicorp/go-plugin"
@@ -88,23 +90,25 @@ type RktDriverConfig struct {
 	Volumes          []string            `mapstructure:"volumes"`            // Host-Volumes to mount in, syntax: /path/to/host/directory:/destination/path/in/container[:readOnly]
 	InsecureOptions  []string            `mapstructure:"insecure_options"`   // list of args for --insecure-options
 
-	NoOverlay bool `mapstructure:"no_overlay"` // disable overlayfs for rkt run
-	Debug     bool `mapstructure:"debug"`      // Enable debug option for rkt command
+	NoOverlay   bool   `mapstructure:"no_overlay"`   // disable overlayfs for rkt run
+	Debug       bool   `mapstructure:"debug"`        // Enable debug option for rkt command
+	PodManifest string `mapstructure:"pod_manifest"` // Allow for pod_manifest to be passed in
 }
 
 // rktHandle is returned from Start/Open as a handle to the PID
 type rktHandle struct {
-	uuid           string
-	env            *env.TaskEnv
-	taskDir        *allocdir.TaskDir
-	pluginClient   *plugin.Client
-	executorPid    int
-	executor       executor.Executor
-	logger         *log.Logger
-	killTimeout    time.Duration
-	maxKillTimeout time.Duration
-	waitCh         chan *dstructs.WaitResult
-	doneCh         chan struct{}
+	uuid            string
+	env             *env.TaskEnv
+	taskDir         *allocdir.TaskDir
+	pluginClient    *plugin.Client
+	executorPid     int
+	executor        executor.Executor
+	logger          *log.Logger
+	killTimeout     time.Duration
+	maxKillTimeout  time.Duration
+	waitCh          chan *dstructs.WaitResult
+	doneCh          chan struct{}
+	podManifestApps appcAppList // Added as a way to get podManifest apps in the Exec function from the Start function
 }
 
 // rktPID is a struct to map the pid running the process to the vm image on
@@ -115,6 +119,34 @@ type rktPID struct {
 	ExecutorPid    int
 	KillTimeout    time.Duration
 	MaxKillTimeout time.Duration
+}
+
+// The appc spec makes the image ID mandatory. However while passing
+// the pod_manifest in the nomad job spec, the ID will not be
+// available. As a result we use lastditch.RuntimeApp to skip
+// validation on the ID field initially and fall back to the appc
+// implementation of RuntimeApp once the ID has been fetched and
+// inserted into the pod manifest.
+type appcRuntimeApp struct {
+	lastditch.RuntimeApp
+	App            *appctypes.App        `json:"app,omitempty"`
+	ReadOnlyRootFS bool                  `json:"readOnlyRootFS,omitempty"`
+	Mounts         []appcschema.Mount    `json:"mounts,omitempty"`
+	Annotations    appctypes.Annotations `json:"annotations,omitempty"`
+}
+
+type appcAppList []appcRuntimeApp
+
+type appcPodManifest struct {
+	ACVersion       string                    `json:"acVersion"`
+	ACKind          string                    `json:"acKind"`
+	Apps            appcAppList               `json:"apps"`
+	Volumes         []appctypes.Volume        `json:"volumes"`
+	Isolators       []appctypes.Isolator      `json:"isolators"`
+	Annotations     appctypes.Annotations     `json:"annotations"`
+	Ports           []appctypes.ExposedPort   `json:"ports"`
+	UserAnnotations appctypes.UserAnnotations `json:"userAnnotations,omitempty"`
+	UserLabels      appctypes.UserLabels      `json:"userLabels,omitempty"`
 }
 
 // Retrieve pod status for the pod with the given UUID.
@@ -208,19 +240,18 @@ func rktManifestMakePortMap(manifest *appcschema.PodManifest, configPortMap map[
 	if len(manifest.Apps) == 0 {
 		return nil, fmt.Errorf("manifest has no apps")
 	}
-	if len(manifest.Apps) != 1 {
-		return nil, fmt.Errorf("manifest has multiple apps!")
-	}
-	app := manifest.Apps[0]
-	if app.App == nil {
-		return nil, fmt.Errorf("specified app has no App object")
-	}
 
 	portMap := make(map[string]int)
-	for svc, name := range configPortMap {
-		for _, port := range app.App.Ports {
-			if port.Name.String() == name {
-				portMap[svc] = int(port.Port)
+	for _, app := range manifest.Apps {
+		if app.App == nil {
+			return nil, fmt.Errorf("specified app %q has no App object", app.Name)
+		}
+
+		for svc, name := range configPortMap {
+			for _, port := range app.App.Ports {
+				if port.Name.String() == name {
+					portMap[svc] = int(port.Port)
+				}
 			}
 		}
 	}
@@ -257,9 +288,13 @@ func (d *RktDriver) Validate(config map[string]interface{}) error {
 	fd := &fields.FieldData{
 		Raw: config,
 		Schema: map[string]*fields.FieldSchema{
+			// image is only required if pod_manifest was not passed in
 			"image": {
-				Type:     fields.TypeString,
-				Required: true,
+				Type: fields.TypeString,
+			},
+			// pod_manifest is only required if image was not passed in
+			"pod_manifest": {
+				Type: fields.TypeString,
 			},
 			"command": {
 				Type: fields.TypeString,
@@ -383,6 +418,16 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse,
 
 	// ACI image
 	img := driverConfig.ImageName
+	podManifestSpecified := false
+
+	// Check if the pod manifest passed in is valid
+	podManifest := appcPodManifest{}
+	if img == "" {
+		if err := json.Unmarshal([]byte(driverConfig.PodManifest), &podManifest); err != nil {
+			return nil, fmt.Errorf("[ERR] driver.rkt: failed to unmarshal pod_manifest to appc schema: %s", err)
+		}
+		podManifestSpecified = true
+	}
 
 	// Global arguments given to both prepare and run-prepared
 	globalArgs := make([]string, 0, 50)
@@ -435,66 +480,139 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse,
 	// Convert underscores to dashes in task names for use in volume names #2358
 	sanitizedName := strings.Replace(task.Name, "_", "-", -1)
 
-	// Mount /alloc
+	// Format volume names
 	allocVolName := fmt.Sprintf("%s-%s-alloc", d.DriverContext.allocID, sanitizedName)
-	prepareArgs = append(prepareArgs, fmt.Sprintf("--volume=%s,kind=host,source=%s", allocVolName, ctx.TaskDir.SharedAllocDir))
-	prepareArgs = append(prepareArgs, fmt.Sprintf("--mount=volume=%s,target=%s", allocVolName, ctx.TaskEnv.EnvMap[env.AllocDir]))
-
-	// Mount /local
 	localVolName := fmt.Sprintf("%s-%s-local", d.DriverContext.allocID, sanitizedName)
-	prepareArgs = append(prepareArgs, fmt.Sprintf("--volume=%s,kind=host,source=%s", localVolName, ctx.TaskDir.LocalDir))
-	prepareArgs = append(prepareArgs, fmt.Sprintf("--mount=volume=%s,target=%s", localVolName, ctx.TaskEnv.EnvMap[env.TaskLocalDir]))
-
-	// Mount /secrets
 	secretsVolName := fmt.Sprintf("%s-%s-secrets", d.DriverContext.allocID, sanitizedName)
-	prepareArgs = append(prepareArgs, fmt.Sprintf("--volume=%s,kind=host,source=%s", secretsVolName, ctx.TaskDir.SecretsDir))
-	prepareArgs = append(prepareArgs, fmt.Sprintf("--mount=volume=%s,target=%s", secretsVolName, ctx.TaskEnv.EnvMap[env.SecretsDir]))
 
-	// Mount arbitrary volumes if enabled
-	if len(driverConfig.Volumes) > 0 {
-		if enabled := d.config.ReadBoolDefault(rktVolumesConfigOption, rktVolumesConfigDefault); !enabled {
-			return nil, fmt.Errorf("%s is false; cannot use rkt volumes: %+q", rktVolumesConfigOption, driverConfig.Volumes)
-		}
-		for i, rawvol := range driverConfig.Volumes {
-			parts := strings.Split(rawvol, ":")
-			readOnly := "false"
-			// job spec:
-			//   volumes = ["/host/path:/container/path[:readOnly]"]
-			// the third parameter is optional, mount is read-write by default
-			if len(parts) == 3 {
-				if parts[2] == "readOnly" {
-					d.logger.Printf("[DEBUG] Mounting %s:%s as readOnly", parts[0], parts[1])
-					readOnly = "true"
-				} else {
-					d.logger.Printf("[WARN] Unknown volume parameter '%s' ignored for mount %s", parts[2], parts[0])
-				}
-			} else if len(parts) != 2 {
-				return nil, fmt.Errorf("invalid rkt volume: %q", rawvol)
+	if podManifestSpecified == false {
+		// Mount /alloc
+		prepareArgs = append(prepareArgs, fmt.Sprintf("--volume=%s,kind=host,source=%s", allocVolName, ctx.TaskDir.SharedAllocDir))
+		prepareArgs = append(prepareArgs, fmt.Sprintf("--mount=volume=%s,target=%s", allocVolName, ctx.TaskEnv.EnvMap[env.AllocDir]))
+
+		// Mount /local
+		prepareArgs = append(prepareArgs, fmt.Sprintf("--volume=%s,kind=host,source=%s", localVolName, ctx.TaskDir.LocalDir))
+		prepareArgs = append(prepareArgs, fmt.Sprintf("--mount=volume=%s,target=%s", localVolName, ctx.TaskEnv.EnvMap[env.TaskLocalDir]))
+
+		// Mount /secrets
+		prepareArgs = append(prepareArgs, fmt.Sprintf("--volume=%s,kind=host,source=%s", secretsVolName, ctx.TaskDir.SecretsDir))
+		prepareArgs = append(prepareArgs, fmt.Sprintf("--mount=volume=%s,target=%s", secretsVolName, ctx.TaskEnv.EnvMap[env.SecretsDir]))
+
+		// Mount arbitrary volumes if enabled
+		if len(driverConfig.Volumes) > 0 {
+			if enabled := d.config.ReadBoolDefault(rktVolumesConfigOption, rktVolumesConfigDefault); !enabled {
+				return nil, fmt.Errorf("%s is false; cannot use rkt volumes: %+q", rktVolumesConfigOption, driverConfig.Volumes)
 			}
-			volName := fmt.Sprintf("%s-%s-%d", d.DriverContext.allocID, sanitizedName, i)
-			prepareArgs = append(prepareArgs, fmt.Sprintf("--volume=%s,kind=host,source=%s,readOnly=%s", volName, parts[0], readOnly))
-			prepareArgs = append(prepareArgs, fmt.Sprintf("--mount=volume=%s,target=%s", volName, parts[1]))
+			for i, rawvol := range driverConfig.Volumes {
+				parts := strings.Split(rawvol, ":")
+				readOnly := "false"
+				// job spec:
+				//   volumes = ["/host/path:/container/path[:readOnly]"]
+				// the third parameter is optional, mount is read-write by default
+				if len(parts) == 3 {
+					if parts[2] == "readOnly" {
+						d.logger.Printf("[DEBUG] Mounting %s:%s as readOnly", parts[0], parts[1])
+						readOnly = "true"
+					} else {
+						d.logger.Printf("[WARN] Unknown volume parameter '%s' ignored for mount %s", parts[2], parts[0])
+					}
+				} else if len(parts) != 2 {
+					return nil, fmt.Errorf("invalid rkt volume: %q", rawvol)
+				}
+				volName := fmt.Sprintf("%s-%s-%d", d.DriverContext.allocID, sanitizedName, i)
+				prepareArgs = append(prepareArgs, fmt.Sprintf("--volume=%s,kind=host,source=%s,readOnly=%s", volName, parts[0], readOnly))
+				prepareArgs = append(prepareArgs, fmt.Sprintf("--mount=volume=%s,target=%s", volName, parts[1]))
+			}
+		}
+
+		// Inject environment variables
+		for k, v := range ctx.TaskEnv.Map() {
+			prepareArgs = append(prepareArgs, fmt.Sprintf("--set-env=%s=%s", k, v))
+		}
+
+		// Image is set here, because the commands that follow apply to it
+		prepareArgs = append(prepareArgs, img)
+
+		// Check if the user has overridden the exec command.
+		if driverConfig.Command != "" {
+			prepareArgs = append(prepareArgs, fmt.Sprintf("--exec=%v", driverConfig.Command))
+		}
+
+		// Add memory isolator
+		prepareArgs = append(prepareArgs, fmt.Sprintf("--memory=%vM", int64(task.Resources.MemoryMB)))
+
+		// Add CPU isolator
+		prepareArgs = append(prepareArgs, fmt.Sprintf("--cpu=%vm", int64(task.Resources.CPU)))
+
+	} else {
+		allocACName := appctypes.MustACName(allocVolName)
+		localACName := appctypes.MustACName(localVolName)
+		secretsACName := appctypes.MustACName(secretsVolName)
+
+		nomadVolumes := []appctypes.Volume{
+			{
+				Name:   *allocACName,
+				Kind:   "host",
+				Source: ctx.TaskDir.SharedAllocDir,
+			},
+			{
+				Name:   *localACName,
+				Kind:   "host",
+				Source: ctx.TaskDir.SharedAllocDir,
+			},
+			{
+				Name:   *secretsACName,
+				Kind:   "host",
+				Source: ctx.TaskDir.SharedAllocDir,
+			},
+		}
+
+		podManifest.Volumes = append(podManifest.Volumes, nomadVolumes...)
+
+		mounts := []appcschema.Mount{
+			{
+				Volume: *allocACName,
+				Path:   allocdir.SharedAllocContainerPath,
+			},
+			{
+				Volume: *localACName,
+				Path:   allocdir.TaskLocalContainerPath,
+			},
+			{
+				Volume: *secretsACName,
+				Path:   allocdir.TaskSecretsContainerPath,
+			},
+		}
+
+		var environment appctypes.Environment
+		for name, value := range ctx.TaskEnv.Map() {
+			environment = append(environment, appctypes.EnvironmentVariable{
+				Name:  name,
+				Value: value,
+			})
+		}
+
+		for i, app := range podManifest.Apps {
+			ID, err := d.fetchImage(app.Image, globalArgs)
+			if err != nil {
+				return nil, err
+			}
+
+			currApp := &podManifest.Apps[i]
+
+			d.logger.Printf("[DEBUG] driver.rkt: Image ID obtained: %s", ID)
+
+			currApp.Image.ID = ID
+			currApp.Image.Name = ""
+			currApp.Mounts = append(currApp.Mounts, mounts...)
+
+			if currApp.App != nil {
+				if err := prepareApp(currApp.App, environment, task); err != nil {
+					return nil, err
+				}
+			}
 		}
 	}
-
-	// Inject environment variables
-	for k, v := range ctx.TaskEnv.Map() {
-		prepareArgs = append(prepareArgs, fmt.Sprintf("--set-env=%s=%s", k, v))
-	}
-
-	// Image is set here, because the commands that follow apply to it
-	prepareArgs = append(prepareArgs, img)
-
-	// Check if the user has overridden the exec command.
-	if driverConfig.Command != "" {
-		prepareArgs = append(prepareArgs, fmt.Sprintf("--exec=%v", driverConfig.Command))
-	}
-
-	// Add memory isolator
-	prepareArgs = append(prepareArgs, fmt.Sprintf("--memory=%vM", int64(task.Resources.MemoryMB)))
-
-	// Add CPU isolator
-	prepareArgs = append(prepareArgs, fmt.Sprintf("--cpu=%vm", int64(task.Resources.CPU)))
 
 	// Add DNS servers
 	if len(driverConfig.DNSServers) == 1 && (driverConfig.DNSServers[0] == "host" || driverConfig.DNSServers[0] == "none") {
@@ -545,11 +663,23 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse,
 			}
 			containerPort = mapped
 
-			hostPortStr := strconv.Itoa(port.Value)
-
 			d.logger.Printf("[DEBUG] driver.rkt: exposed port %s", containerPort)
+
 			// Add port option to rkt run arguments. rkt allows multiple port args
-			prepareArgs = append(prepareArgs, fmt.Sprintf("--port=%s:%s", containerPort, hostPortStr))
+			if podManifestSpecified == false {
+				hostPortStr := strconv.Itoa(port.Value)
+				prepareArgs = append(prepareArgs, fmt.Sprintf("--port=%s:%s", containerPort, hostPortStr))
+			} else {
+				containerPortACName, err := appctypes.NewACName(containerPort)
+				if err != nil {
+					return nil, fmt.Errorf("[ERR] driver.rkt: failed to set ACName for %s: %s", containerPort, err)
+				}
+
+				podManifest.Ports = append(podManifest.Ports, appctypes.ExposedPort{
+					Name:     *containerPortACName,
+					HostPort: uint(port.Value),
+				})
+			}
 		}
 
 		for _, port := range network.DynamicPorts {
@@ -563,18 +693,62 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse,
 				return nil, fmt.Errorf("port_map is not set. When you defined port in the resources, you need to configure port_map.")
 			}
 
-			hostPortStr := strconv.Itoa(port.Value)
-
 			d.logger.Printf("[DEBUG] driver.rkt: exposed port %s", containerPort)
-			// Add port option to rkt run arguments. rkt allows multiple port args
-			prepareArgs = append(prepareArgs, fmt.Sprintf("--port=%s:%s", containerPort, hostPortStr))
-		}
 
+			// Add port option to rkt run arguments. rkt allows multiple port args
+			if podManifestSpecified == false {
+				hostPortStr := strconv.Itoa(port.Value)
+				prepareArgs = append(prepareArgs, fmt.Sprintf("--port=%s:%s", containerPort, hostPortStr))
+			} else {
+				containerPortACName, err := appctypes.NewACName(containerPort)
+				if err != nil {
+					return nil, fmt.Errorf("[ERR] driver.rkt: failed to set ACName for %s: %s", containerPort, err)
+				}
+
+				podManifest.Ports = append(podManifest.Ports, appctypes.ExposedPort{
+					Name:     *containerPortACName,
+					HostPort: uint(port.Value),
+				})
+			}
+		}
 	}
 
-	// If a user has been specified for the task, pass it through to the user
-	if task.User != "" {
-		prepareArgs = append(prepareArgs, fmt.Sprintf("--user=%s", task.User))
+	if podManifestSpecified == false {
+		// If a user has been specified for the task, pass it through to the user
+		if task.User != "" {
+			prepareArgs = append(prepareArgs, fmt.Sprintf("--user=%s", task.User))
+		}
+	} else {
+		podManifestStr, err := json.Marshal(podManifest)
+		if err != nil {
+			return nil, fmt.Errorf("[ERR] driver.rkt: failed to marshal rkt pod manifest to JSON: %s", err)
+		}
+
+		// Ensure that the generated pod manifest is valid according to the appc spec
+		validatePodManifest := appcschema.PodManifest{}
+		if err := json.Unmarshal(podManifestStr, &validatePodManifest); err != nil {
+			return nil, fmt.Errorf("[ERR] driver.rkt: Invalid rkt pod manifest: %s", err)
+		}
+
+		// Create temporary file to dump the contents of podManifest
+		tmpfile, err := ioutil.TempFile("", "nomad-rkt-pod")
+		if err != nil {
+			return nil, err
+		}
+
+		podManifestTmpfile := tmpfile.Name()
+		defer os.Remove(podManifestTmpfile)
+
+		if _, err := tmpfile.Write(podManifestStr); err != nil {
+			tmpfile.Close()
+			return nil, err
+		}
+		tmpfile.Close()
+
+		d.logger.Printf("[DEBUG] driver.rkt: wrote json to temp file %s", podManifestTmpfile)
+
+		// Set pod manifest flag
+		prepareArgs = append(prepareArgs, fmt.Sprintf("--pod-manifest=%s", podManifestTmpfile))
 	}
 
 	// Add user passed arguments.
@@ -611,13 +785,21 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse,
 	cmd := exec.Command(rktCmd, prepareArgs...)
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
-	d.logger.Printf("[DEBUG] driver.rkt: preparing pod %q for task %q with: %v", img, d.taskName, prepareArgs)
+	if podManifestSpecified == false {
+		d.logger.Printf("[DEBUG] driver.rkt: preparing pod %q for task %q with: %v", img, d.taskName, prepareArgs)
+	} else {
+		d.logger.Printf("[DEBUG] driver.rkt: preparing pod with pod manifest for task %q with: %v", d.taskName, prepareArgs)
+	}
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("Error preparing rkt pod: %s\n\nOutput: %s\n\nError: %s",
 			err, outBuf.String(), errBuf.String())
 	}
 	uuid := strings.TrimSpace(outBuf.String())
-	d.logger.Printf("[DEBUG] driver.rkt: pod %q for task %q prepared, UUID is: %s", img, d.taskName, uuid)
+	if podManifestSpecified == false {
+		d.logger.Printf("[DEBUG] driver.rkt: pod %q for task %q prepared, UUID is: %s", img, d.taskName, uuid)
+	} else {
+		d.logger.Printf("[DEBUG] driver.rkt: pod with pod manifest for task %q prepared, UUID is: %s", d.taskName, uuid)
+	}
 	runArgs = append(runArgs, uuid)
 
 	// The task's environment is set via --set-env flags above, but the rkt
@@ -647,31 +829,44 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse,
 		return nil, err
 	}
 
-	d.logger.Printf("[DEBUG] driver.rkt: started ACI %q (UUID: %s) for task %q with: %v", img, uuid, d.taskName, runArgs)
+	if podManifestSpecified == false {
+		d.logger.Printf("[DEBUG] driver.rkt: started ACI %q (UUID: %s) for task %q with: %v", img, uuid, d.taskName, runArgs)
+	} else {
+		d.logger.Printf("[DEBUG] driver.rkt: started ACI with pod manifest (UUID: %s) for task %q with: %v", uuid, d.taskName, runArgs)
+	}
+
 	maxKill := d.DriverContext.config.MaxKillTimeout
 	h := &rktHandle{
-		uuid:           uuid,
-		env:            rktEnv,
-		taskDir:        ctx.TaskDir,
-		pluginClient:   pluginClient,
-		executor:       execIntf,
-		executorPid:    ps.Pid,
-		logger:         d.logger,
-		killTimeout:    GetKillTimeout(task.KillTimeout, maxKill),
-		maxKillTimeout: maxKill,
-		doneCh:         make(chan struct{}),
-		waitCh:         make(chan *dstructs.WaitResult, 1),
+		uuid:            uuid,
+		env:             rktEnv,
+		taskDir:         ctx.TaskDir,
+		pluginClient:    pluginClient,
+		executor:        execIntf,
+		executorPid:     ps.Pid,
+		logger:          d.logger,
+		killTimeout:     GetKillTimeout(task.KillTimeout, maxKill),
+		maxKillTimeout:  maxKill,
+		doneCh:          make(chan struct{}),
+		waitCh:          make(chan *dstructs.WaitResult, 1),
+		podManifestApps: podManifest.Apps,
 	}
 	go h.run()
 
 	// Only return a driver network if *not* using host networking
 	var driverNetwork *cstructs.DriverNetwork
 	if network != "host" {
-		d.logger.Printf("[DEBUG] driver.rkt: retrieving network information for pod %q (UUID %s) for task %q", img, uuid, d.taskName)
+		if podManifestSpecified == false {
+			d.logger.Printf("[DEBUG] driver.rkt: retrieving network information for pod %q (UUID %s) for task %q", img, uuid, d.taskName)
+		} else {
+			d.logger.Printf("[DEBUG] driver.rkt: retrieving network information with pod manifest (UUID %s) for task %q", uuid, d.taskName)
+		}
 		driverNetwork, err = rktGetDriverNetwork(uuid, driverConfig.PortMap)
 		if err != nil && !pluginClient.Exited() {
-			d.logger.Printf("[WARN] driver.rkt: network status retrieval for pod %q (UUID %s) for task %q failed. Last error: %v", img, uuid, d.taskName, err)
-
+			if podManifestSpecified == false {
+				d.logger.Printf("[WARN] driver.rkt: network status retrieval for pod %q (UUID %s) for task %q failed. Last error: %v", img, uuid, d.taskName, err)
+			} else {
+				d.logger.Printf("[WARN] driver.rkt: network status retrieval with pod manifest (UUID %s) for task %q failed. Last error: %v", uuid, d.taskName, err)
+			}
 			// If a portmap was given, this turns into a fatal error
 			if len(driverConfig.PortMap) != 0 {
 				pluginClient.Kill()
@@ -731,6 +926,77 @@ func (d *RktDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error
 	return h, nil
 }
 
+func (d *RktDriver) fetchImage(img lastditch.RuntimeImage, globalArgs []string) (string, error) {
+	if img.Name == "" {
+		return "", fmt.Errorf("image name cannot be empty")
+	}
+
+	// Set version to latest by default and override if it is supplied in the pod manifest
+	version := "latest"
+	for _, label := range img.Labels {
+		if label.Name == "version" {
+			version = label.Value
+			break
+		}
+	}
+
+	imgName := fmt.Sprintf("%s:%s", img.Name, version)
+
+	fetchArgs := make([]string, 0, len(globalArgs)+2)
+	fetchArgs = append(fetchArgs, globalArgs...)
+	fetchArgs = append(fetchArgs, []string{"fetch", imgName}...)
+
+	var outBuf, errBuf bytes.Buffer
+	cmd := exec.Command("rkt", fetchArgs...)
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+
+	d.logger.Printf("[DEBUG] driver.rkt: fetching image %q for task %q with: %v", img, d.taskName, fetchArgs)
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to fetch image: %s\n\nOutput: %s\n\nError: %s", err, outBuf.String(), errBuf.String())
+	}
+
+	return strings.TrimSpace(outBuf.String()), nil
+}
+
+func prepareApp(app *appctypes.App, environment appctypes.Environment, task *structs.Task) error {
+	if app.Environment != nil {
+		app.Environment = append(app.Environment, environment...)
+	} else {
+		app.Environment = environment
+	}
+
+	isolators := app.Isolators
+
+	// Add memory isolator
+	memoryACIdentifier := appctypes.MustACIdentifier(appctypes.ResourceMemoryName)
+	if isolators.GetByName(*memoryACIdentifier) == nil {
+		s := fmt.Sprintf("%vM", task.Resources.MemoryMB)
+		resMemory, err := appctypes.NewResourceMemoryIsolator(s, s)
+		if err != nil {
+			return fmt.Errorf("[ERR] driver.rkt: failed to create ResourceMemory: %s", err)
+		}
+
+		isolators = append(isolators, resMemory.AsIsolator())
+	}
+
+	// Add CPU isolator
+	cpuACIdentifier := appctypes.MustACIdentifier(appctypes.ResourceCPUName)
+	if isolators.GetByName(*cpuACIdentifier) == nil {
+		s := fmt.Sprintf("%vm", task.Resources.CPU)
+		resCPU, err := appctypes.NewResourceCPUIsolator(s, s)
+		if err != nil {
+			return fmt.Errorf("[ERR] driver.rkt: failed to create ResourceCPU: %s", err)
+		}
+
+		isolators = append(isolators, resCPU.AsIsolator())
+	}
+
+	app.Isolators = isolators
+
+	return nil
+}
+
 func (h *rktHandle) ID() string {
 	// Return a handle to the PID
 	pid := &rktPID{
@@ -764,12 +1030,28 @@ func (h *rktHandle) Exec(ctx context.Context, cmd string, args []string) ([]byte
 	if h.uuid == "" {
 		return nil, 0, fmt.Errorf("unable to find rkt pod UUID")
 	}
+
 	// enter + UUID + cmd + args...
-	enterArgs := make([]string, 3+len(args))
+	// If a pod manifest with multiple apps is used, use the first app for the command:
+	// enter + --<app=appname> + UUID + cmd + args...
+
+	// TODO: This is a hack that lets us test command execution in
+	// tests. To get rid of the hack we need to be able to pass
+	// the app name to Exec but that breaks the ScriptExecutor interface.
+	// This can be fixed as a separate PR in the future.
+
+	enterArgs := make([]string, 4+len(args))
 	enterArgs[0] = "enter"
-	enterArgs[1] = h.uuid
-	enterArgs[2] = cmd
-	copy(enterArgs[3:], args)
+	if len(h.podManifestApps) > 1 {
+		enterArgs[1] = fmt.Sprintf("--app=%s", h.podManifestApps[0].Name)
+		enterArgs[2] = h.uuid
+		enterArgs[3] = cmd
+		copy(enterArgs[4:], args)
+	} else {
+		enterArgs[1] = h.uuid
+		enterArgs[2] = cmd
+		copy(enterArgs[3:], args)
+	}
 	return executor.ExecScript(ctx, h.taskDir.Dir, h.env, nil, rktCmd, enterArgs)
 }
 
