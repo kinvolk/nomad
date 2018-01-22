@@ -21,6 +21,8 @@ import (
 	"time"
 
 	appcschema "github.com/appc/spec/schema"
+	"github.com/appc/spec/schema/lastditch"
+	appctypes "github.com/appc/spec/schema/types"
 	rktv1 "github.com/rkt/rkt/api/v1"
 
 	"github.com/hashicorp/go-plugin"
@@ -88,8 +90,9 @@ type RktDriverConfig struct {
 	Volumes          []string            `mapstructure:"volumes"`            // Host-Volumes to mount in, syntax: /path/to/host/directory:/destination/path/in/container[:readOnly]
 	InsecureOptions  []string            `mapstructure:"insecure_options"`   // list of args for --insecure-options
 
-	NoOverlay bool `mapstructure:"no_overlay"` // disable overlayfs for rkt run
-	Debug     bool `mapstructure:"debug"`      // Enable debug option for rkt command
+	NoOverlay   bool   `mapstructure:"no_overlay"`   // disable overlayfs for rkt run
+	Debug       bool   `mapstructure:"debug"`        // Enable debug option for rkt command
+	PodManifest string `mapstructure:"pod_manifest"` // Allow for pod_manifest to be passed in
 }
 
 // rktHandle is returned from Start/Open as a handle to the PID
@@ -115,6 +118,28 @@ type rktPID struct {
 	ExecutorPid    int
 	KillTimeout    time.Duration
 	MaxKillTimeout time.Duration
+}
+
+type appcRuntimeApp struct {
+	lastditch.RuntimeApp
+	App            *appctypes.App        `json:"app,omitempty"`
+	ReadOnlyRootFS bool                  `json:"readOnlyRootFS,omitempty"`
+	Mounts         []appcschema.Mount    `json:"mounts,omitempty"`
+	Annotations    appctypes.Annotations `json:"annotations,omitempty"`
+}
+
+type appcAppList []appcRuntimeApp
+
+type appcPodManifest struct {
+	ACVersion       string                    `json:"acVersion"`
+	ACKind          string                    `json:"acKind"`
+	Apps            appcAppList               `json:"apps"`
+	Volumes         []appctypes.Volume        `json:"volumes"`
+	Isolators       []appctypes.Isolator      `json:"isolators"`
+	Annotations     appctypes.Annotations     `json:"annotations"`
+	Ports           []appctypes.ExposedPort   `json:"ports"`
+	UserAnnotations appctypes.UserAnnotations `json:"userAnnotations,omitempty"`
+	UserLabels      appctypes.UserLabels      `json:"userLabels,omitempty"`
 }
 
 // Retrieve pod status for the pod with the given UUID.
@@ -257,9 +282,9 @@ func (d *RktDriver) Validate(config map[string]interface{}) error {
 	fd := &fields.FieldData{
 		Raw: config,
 		Schema: map[string]*fields.FieldSchema{
+			// image is only required if pod_manifest was not passed in
 			"image": {
-				Type:     fields.TypeString,
-				Required: true,
+				Type: fields.TypeString,
 			},
 			"command": {
 				Type: fields.TypeString,
@@ -293,6 +318,10 @@ func (d *RktDriver) Validate(config map[string]interface{}) error {
 			},
 			"insecure_options": {
 				Type: fields.TypeArray,
+			},
+			// pod_manifest is only required if image was not passed in
+			"pod_manifest": {
+				Type: fields.TypeString,
 			},
 		},
 	}
@@ -384,6 +413,14 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse,
 	// ACI image
 	img := driverConfig.ImageName
 
+	podManifest := appcPodManifest{}
+	// Check if the pod manifest passed in is valid
+	if img == "" {
+		if err := json.Unmarshal([]byte(driverConfig.PodManifest), &podManifest); err != nil {
+			return nil, fmt.Errorf("[ERR] driver.rkt: failed to unmarshal pod_manifest to appc schema: %s", err)
+		}
+	}
+
 	// Global arguments given to both prepare and run-prepared
 	globalArgs := make([]string, 0, 50)
 
@@ -419,108 +456,198 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse,
 	// debug is rkt's global argument, so add it before the actual "run"
 	globalArgs = append(globalArgs, fmt.Sprintf("--debug=%t", debug))
 
+	fetchArgs := make([]string, 0, 50)
 	prepareArgs := make([]string, 0, 50)
 	runArgs := make([]string, 0, 50)
 
+	fetchArgs = append(fetchArgs, globalArgs...)
+	fetchArgs = append(fetchArgs, "fetch")
 	prepareArgs = append(prepareArgs, globalArgs...)
 	prepareArgs = append(prepareArgs, "prepare")
 	runArgs = append(runArgs, globalArgs...)
 	runArgs = append(runArgs, "run-prepared")
 
-	// disable overlayfs
-	if driverConfig.NoOverlay {
-		prepareArgs = append(prepareArgs, "--no-overlay=true")
-	}
-
-	// Convert underscores to dashes in task names for use in volume names #2358
-	sanitizedName := strings.Replace(task.Name, "_", "-", -1)
-
-	// Mount /alloc
-	allocVolName := fmt.Sprintf("%s-%s-alloc", d.DriverContext.allocID, sanitizedName)
-	prepareArgs = append(prepareArgs, fmt.Sprintf("--volume=%s,kind=host,source=%s", allocVolName, ctx.TaskDir.SharedAllocDir))
-	prepareArgs = append(prepareArgs, fmt.Sprintf("--mount=volume=%s,target=%s", allocVolName, allocdir.SharedAllocContainerPath))
-
-	// Mount /local
-	localVolName := fmt.Sprintf("%s-%s-local", d.DriverContext.allocID, sanitizedName)
-	prepareArgs = append(prepareArgs, fmt.Sprintf("--volume=%s,kind=host,source=%s", localVolName, ctx.TaskDir.LocalDir))
-	prepareArgs = append(prepareArgs, fmt.Sprintf("--mount=volume=%s,target=%s", localVolName, allocdir.TaskLocalContainerPath))
-
-	// Mount /secrets
-	secretsVolName := fmt.Sprintf("%s-%s-secrets", d.DriverContext.allocID, sanitizedName)
-	prepareArgs = append(prepareArgs, fmt.Sprintf("--volume=%s,kind=host,source=%s", secretsVolName, ctx.TaskDir.SecretsDir))
-	prepareArgs = append(prepareArgs, fmt.Sprintf("--mount=volume=%s,target=%s", secretsVolName, allocdir.TaskSecretsContainerPath))
-
-	// Mount arbitrary volumes if enabled
-	if len(driverConfig.Volumes) > 0 {
-		if enabled := d.config.ReadBoolDefault(rktVolumesConfigOption, rktVolumesConfigDefault); !enabled {
-			return nil, fmt.Errorf("%s is false; cannot use rkt volumes: %+q", rktVolumesConfigOption, driverConfig.Volumes)
-		}
-		for i, rawvol := range driverConfig.Volumes {
-			parts := strings.Split(rawvol, ":")
-			readOnly := "false"
-			// job spec:
-			//   volumes = ["/host/path:/container/path[:readOnly]"]
-			// the third parameter is optional, mount is read-write by default
-			if len(parts) == 3 {
-				if parts[2] == "readOnly" {
-					d.logger.Printf("[DEBUG] Mounting %s:%s as readOnly", parts[0], parts[1])
-					readOnly = "true"
-				} else {
-					d.logger.Printf("[WARN] Unknown volume parameter '%s' ignored for mount %s", parts[2], parts[0])
-				}
-			} else if len(parts) != 2 {
-				return nil, fmt.Errorf("invalid rkt volume: %q", rawvol)
-			}
-			volName := fmt.Sprintf("%s-%s-%d", d.DriverContext.allocID, sanitizedName, i)
-			prepareArgs = append(prepareArgs, fmt.Sprintf("--volume=%s,kind=host,source=%s,readOnly=%s", volName, parts[0], readOnly))
-			prepareArgs = append(prepareArgs, fmt.Sprintf("--mount=volume=%s,target=%s", volName, parts[1]))
-		}
-	}
-
-	// Inject environment variables
-	for k, v := range ctx.TaskEnv.Map() {
-		prepareArgs = append(prepareArgs, fmt.Sprintf("--set-env=%s=%s", k, v))
-	}
-
-	// Image is set here, because the commands that follow apply to it
-	prepareArgs = append(prepareArgs, img)
-
-	// Check if the user has overridden the exec command.
-	if driverConfig.Command != "" {
-		prepareArgs = append(prepareArgs, fmt.Sprintf("--exec=%v", driverConfig.Command))
-	}
-
-	// Add memory isolator
-	prepareArgs = append(prepareArgs, fmt.Sprintf("--memory=%vM", int64(task.Resources.MemoryMB)))
-
-	// Add CPU isolator
-	prepareArgs = append(prepareArgs, fmt.Sprintf("--cpu=%vm", int64(task.Resources.CPU)))
-
-	// Add DNS servers
-	if len(driverConfig.DNSServers) == 1 && (driverConfig.DNSServers[0] == "host" || driverConfig.DNSServers[0] == "none") {
-		// Special case single item lists with the special values "host" or "none"
-		runArgs = append(runArgs, fmt.Sprintf("--dns=%s", driverConfig.DNSServers[0]))
-	} else {
-		for _, ip := range driverConfig.DNSServers {
-			if err := net.ParseIP(ip); err == nil {
-				msg := fmt.Errorf("invalid ip address for container dns server %q", ip)
-				d.logger.Printf("[DEBUG] driver.rkt: %v", msg)
-				return nil, msg
-			} else {
-				runArgs = append(runArgs, fmt.Sprintf("--dns=%s", ip))
-			}
-		}
-	}
-
-	// set DNS search domains
-	for _, domain := range driverConfig.DNSSearchDomains {
-		runArgs = append(runArgs, fmt.Sprintf("--dns-search=%s", domain))
-	}
-
 	// set network
 	network := strings.Join(driverConfig.Net, ",")
 	if network != "" {
 		runArgs = append(runArgs, fmt.Sprintf("--net=%s", network))
+	}
+
+	var podManifestTempFile string
+
+	// Convert underscores to dashes in task names for use in volume names #2358
+	sanitizedName := strings.Replace(task.Name, "_", "-", -1)
+
+	// Format volume names appropriately
+	allocVolName := fmt.Sprintf("%s-%s-alloc", d.DriverContext.allocID, sanitizedName)
+	localVolName := fmt.Sprintf("%s-%s-local", d.DriverContext.allocID, sanitizedName)
+	secretsVolName := fmt.Sprintf("%s-%s-secrets", d.DriverContext.allocID, sanitizedName)
+
+	if img == "" {
+		allocACName, err := appctypes.NewACName(allocVolName)
+		if err != nil {
+			return nil, fmt.Errorf("[ERR] driver.rkt: failed to set ACName: %s", err)
+		}
+
+		localACName, err := appctypes.NewACName(localVolName)
+		if err != nil {
+			return nil, fmt.Errorf("[ERR] driver.rkt: failed to set ACName: %s", err)
+		}
+
+		secretsACName, err := appctypes.NewACName(secretsVolName)
+		if err != nil {
+			return nil, fmt.Errorf("[ERR] driver.rkt: failed to set ACName: %s", err)
+		}
+
+		podManifest.Volumes = []appctypes.Volume{
+			{
+				Name:   *allocACName,
+				Kind:   "host",
+				Source: ctx.TaskDir.SharedAllocDir,
+			},
+			{
+				Name:   *localACName,
+				Kind:   "host",
+				Source: ctx.TaskDir.SharedAllocDir,
+			},
+			{
+				Name:   *secretsACName,
+				Kind:   "host",
+				Source: ctx.TaskDir.SharedAllocDir,
+			},
+		}
+
+		mounts := []appcschema.Mount{
+			{
+				Volume: *allocACName,
+				Path:   allocdir.SharedAllocContainerPath,
+			},
+			{
+				Volume: *localACName,
+				Path:   allocdir.TaskLocalContainerPath,
+			},
+			{
+				Volume: *secretsACName,
+				Path:   allocdir.TaskSecretsContainerPath,
+			},
+		}
+
+		var environment appctypes.Environment
+		for name, value := range ctx.TaskEnv.Map() {
+			environment = append(environment, appctypes.EnvironmentVariable{
+				Name:  name,
+				Value: value,
+			})
+		}
+
+		for i, app := range podManifest.Apps {
+			ID, err := d.fetchImage(app.Image, fetchArgs)
+			if err != nil {
+				return nil, err
+			}
+
+			currApp := &podManifest.Apps[i]
+
+			d.logger.Printf("[DEBUG] driver.rkt: Image ID obtained: %s", ID)
+
+			currApp.Image.ID = ID
+			currApp.Mounts = mounts
+			currApp.App.Environment = append(currApp.App.Environment, environment...)
+
+			// Add memory isolator
+			isolators := currApp.App.Isolators
+			memoryACIdentifier, err := appctypes.NewACIdentifier(appctypes.ResourceMemoryName)
+			if err != nil {
+				return nil, fmt.Errorf("[ERR] driver.rkt: failed to set ACIdentifier: %s", err)
+			}
+
+			if isolators.GetByName(*memoryACIdentifier) == nil {
+				s := fmt.Sprintf("%vM", task.Resources.MemoryMB)
+				resMemory, err := appctypes.NewResourceMemoryIsolator(s, s)
+				if err != nil {
+					return nil, fmt.Errorf("[ERR] driver.rkt: failed to create ResourceMemory: %s", err)
+				}
+
+				currApp.App.Isolators = append(isolators, resMemory.AsIsolator())
+			}
+
+			// Add CPU isolator
+			isolators = currApp.App.Isolators
+			cpuACIdentifier, err := appctypes.NewACIdentifier(appctypes.ResourceCPUName)
+			if err != nil {
+				return nil, fmt.Errorf("[ERR] driver.rkt: failed to set ACIdentifier: %s", err)
+			}
+
+			if isolators.GetByName(*cpuACIdentifier) == nil {
+				s := fmt.Sprintf("%vm", task.Resources.CPU)
+				resCPU, err := appctypes.NewResourceCPUIsolator(s, s)
+				if err != nil {
+					return nil, fmt.Errorf("[ERR] driver.rkt: failed to create ResourceCPU: %s", err)
+				}
+
+				currApp.App.Isolators = append(isolators, resCPU.AsIsolator())
+			}
+
+		}
+	} else {
+		// Mount /alloc
+		prepareArgs = append(prepareArgs, fmt.Sprintf("--volume=%s,kind=host,source=%s", allocVolName, ctx.TaskDir.SharedAllocDir))
+		prepareArgs = append(prepareArgs, fmt.Sprintf("--mount=volume=%s,target=%s", allocVolName, allocdir.SharedAllocContainerPath))
+
+		// Mount /local
+		prepareArgs = append(prepareArgs, fmt.Sprintf("--volume=%s,kind=host,source=%s", localVolName, ctx.TaskDir.LocalDir))
+		prepareArgs = append(prepareArgs, fmt.Sprintf("--mount=volume=%s,target=%s", localVolName, allocdir.TaskLocalContainerPath))
+
+		// Mount /secrets
+		prepareArgs = append(prepareArgs, fmt.Sprintf("--volume=%s,kind=host,source=%s", secretsVolName, ctx.TaskDir.SecretsDir))
+		prepareArgs = append(prepareArgs, fmt.Sprintf("--mount=volume=%s,target=%s", secretsVolName, allocdir.TaskSecretsContainerPath))
+
+		// Mount arbitrary volumes if enabled
+		if len(driverConfig.Volumes) > 0 {
+			if enabled := d.config.ReadBoolDefault(rktVolumesConfigOption, rktVolumesConfigDefault); !enabled {
+				return nil, fmt.Errorf("%s is false; cannot use rkt volumes: %+q", rktVolumesConfigOption, driverConfig.Volumes)
+			}
+			for i, rawvol := range driverConfig.Volumes {
+				parts := strings.Split(rawvol, ":")
+				readOnly := "false"
+				// job spec:
+				//   volumes = ["/host/path:/container/path[:readOnly]"]
+				// the third parameter is optional, mount is read-write by default
+				if len(parts) == 3 {
+					if parts[2] == "readOnly" {
+						d.logger.Printf("[DEBUG] Mounting %s:%s as readOnly", parts[0], parts[1])
+						readOnly = "true"
+					} else {
+						d.logger.Printf("[WARN] Unknown volume parameter '%s' ignored for mount %s", parts[2], parts[0])
+					}
+				} else if len(parts) != 2 {
+					return nil, fmt.Errorf("invalid rkt volume: %q", rawvol)
+				}
+				volName := fmt.Sprintf("%s-%s-%d", d.DriverContext.allocID, sanitizedName, i)
+				prepareArgs = append(prepareArgs, fmt.Sprintf("--volume=%s,kind=host,source=%s,readOnly=%s", volName, parts[0], readOnly))
+				prepareArgs = append(prepareArgs, fmt.Sprintf("--mount=volume=%s,target=%s", volName, parts[1]))
+			}
+		}
+
+		// Inject environment variables
+		for k, v := range ctx.TaskEnv.Map() {
+			prepareArgs = append(prepareArgs, fmt.Sprintf("--set-env=%s=%s", k, v))
+		}
+
+		// Image is set here, because the commands that follow apply to it
+		prepareArgs = append(prepareArgs, img)
+
+		// Check if the user has overridden the exec command.
+		if driverConfig.Command != "" {
+			prepareArgs = append(prepareArgs, fmt.Sprintf("--exec=%v", driverConfig.Command))
+		}
+
+		// Add memory isolator
+		prepareArgs = append(prepareArgs, fmt.Sprintf("--memory=%vM", int64(task.Resources.MemoryMB)))
+
+		// Add CPU isolator
+		prepareArgs = append(prepareArgs, fmt.Sprintf("--cpu=%vm", int64(task.Resources.CPU)))
+
 	}
 
 	// Setup port mapping and exposed ports
@@ -545,11 +672,23 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse,
 			}
 			containerPort = mapped
 
-			hostPortStr := strconv.Itoa(port.Value)
-
 			d.logger.Printf("[DEBUG] driver.rkt: exposed port %s", containerPort)
+
 			// Add port option to rkt run arguments. rkt allows multiple port args
-			prepareArgs = append(prepareArgs, fmt.Sprintf("--port=%s:%s", containerPort, hostPortStr))
+			if img == "" {
+				containerPortACName, err := appctypes.NewACName(containerPort)
+				if err != nil {
+					return nil, fmt.Errorf("[ERR] driver.rkt: failed to set ACName: %s", err)
+				}
+
+				podManifest.Ports = append(podManifest.Ports, appctypes.ExposedPort{
+					Name:     *containerPortACName,
+					HostPort: uint(port.Value),
+				})
+			} else {
+				hostPortStr := strconv.Itoa(port.Value)
+				prepareArgs = append(prepareArgs, fmt.Sprintf("--port=%s:%s", containerPort, hostPortStr))
+			}
 		}
 
 		for _, port := range network.DynamicPorts {
@@ -563,13 +702,81 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse,
 				return nil, fmt.Errorf("port_map is not set. When you defined port in the resources, you need to configure port_map.")
 			}
 
-			hostPortStr := strconv.Itoa(port.Value)
-
 			d.logger.Printf("[DEBUG] driver.rkt: exposed port %s", containerPort)
+
 			// Add port option to rkt run arguments. rkt allows multiple port args
-			prepareArgs = append(prepareArgs, fmt.Sprintf("--port=%s:%s", containerPort, hostPortStr))
+			if img == "" {
+				containerPortACName, err := appctypes.NewACName(containerPort)
+				if err != nil {
+					return nil, fmt.Errorf("[ERR] driver.rkt: failed to set ACName: %s", err)
+				}
+
+				podManifest.Ports = append(podManifest.Ports, appctypes.ExposedPort{
+					Name:     *containerPortACName,
+					HostPort: uint(port.Value),
+				})
+			} else {
+				hostPortStr := strconv.Itoa(port.Value)
+				prepareArgs = append(prepareArgs, fmt.Sprintf("--port=%s:%s", containerPort, hostPortStr))
+			}
+		}
+	}
+
+	// Add DNS servers
+	if len(driverConfig.DNSServers) == 1 && (driverConfig.DNSServers[0] == "host" || driverConfig.DNSServers[0] == "none") {
+		// Special case single item lists with the special values "host" or "none"
+		runArgs = append(runArgs, fmt.Sprintf("--dns=%s", driverConfig.DNSServers[0]))
+	} else {
+		for _, ip := range driverConfig.DNSServers {
+			if err := net.ParseIP(ip); err == nil {
+				msg := fmt.Errorf("invalid ip address for container dns server %q", ip)
+				d.logger.Printf("[DEBUG] driver.rkt: %v", msg)
+				return nil, msg
+			} else {
+				runArgs = append(runArgs, fmt.Sprintf("--dns=%s", ip))
+			}
+		}
+	}
+
+	// set DNS search domains
+	for _, domain := range driverConfig.DNSSearchDomains {
+		runArgs = append(runArgs, fmt.Sprintf("--dns-search=%s", domain))
+	}
+
+	if img == "" {
+		podManifestStr, err := json.Marshal(podManifest)
+		if err != nil {
+			return nil, fmt.Errorf("[ERR] driver.rkt: failed to marshal rkt pod manifest to JSON: %s", err)
 		}
 
+		// Ensure that the generated pod manifest is valid according to the appc spec
+		validatePodManifest := appcschema.PodManifest{}
+		if err := json.Unmarshal(podManifestStr, &validatePodManifest); err != nil {
+			return nil, fmt.Errorf("[ERR] driver.rkt: Invalid rkt pod manifest: %s", err)
+		}
+
+		// Create temporary file to dump the contents of podManifest
+		tmpfile, err := ioutil.TempFile("", "pod")
+		if err != nil {
+			return nil, err
+		}
+		podManifestTempFile = tmpfile.Name()
+		defer os.Remove(podManifestTempFile)
+		defer tmpfile.Close()
+
+		if _, err := tmpfile.Write(podManifestStr); err != nil {
+			return nil, err
+		}
+
+		d.logger.Printf("[DEBUG] driver.rkt: wrote json to temp file %s", podManifestTempFile)
+
+		// pod manifest is set here
+		prepareArgs = append(prepareArgs, fmt.Sprintf("--pod-manifest=%s", podManifestTempFile))
+	}
+
+	// disable overlayfs
+	if driverConfig.NoOverlay {
+		prepareArgs = append(prepareArgs, "--no-overlay=true")
 	}
 
 	// If a user has been specified for the task, pass it through to the user
@@ -611,13 +818,21 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse,
 	cmd := exec.Command(rktCmd, prepareArgs...)
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
-	d.logger.Printf("[DEBUG] driver.rkt: preparing pod %q for task %q with: %v", img, d.taskName, prepareArgs)
+	if img == "" {
+		d.logger.Printf("[DEBUG] driver.rkt: preparing pod with pod manifest file %s for task %q with: %v", podManifestTempFile, d.taskName, prepareArgs)
+	} else {
+		d.logger.Printf("[DEBUG] driver.rkt: preparing pod %q for task %q with: %v", img, d.taskName, prepareArgs)
+	}
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("Error preparing rkt pod: %s\n\nOutput: %s\n\nError: %s",
 			err, outBuf.String(), errBuf.String())
 	}
 	uuid := strings.TrimSpace(outBuf.String())
-	d.logger.Printf("[DEBUG] driver.rkt: pod %q for task %q prepared, UUID is: %s", img, d.taskName, uuid)
+	if img == "" {
+		d.logger.Printf("[DEBUG] driver.rkt: pod with pod manifest file %s for task %q prepared, UUID is: %s", podManifestTempFile, d.taskName, uuid)
+	} else {
+		d.logger.Printf("[DEBUG] driver.rkt: pod %q for task %q prepared, UUID is: %s", img, d.taskName, uuid)
+	}
 	runArgs = append(runArgs, uuid)
 
 	// The task's environment is set via --set-env flags above, but the rkt
@@ -647,7 +862,12 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse,
 		return nil, err
 	}
 
-	d.logger.Printf("[DEBUG] driver.rkt: started ACI %q (UUID: %s) for task %q with: %v", img, uuid, d.taskName, runArgs)
+	if img == "" {
+		d.logger.Printf("[DEBUG] driver.rkt: started ACI with pod manifest file %s (UUID: %s) for task %q with: %v", podManifestTempFile, uuid, d.taskName, runArgs)
+	} else {
+		d.logger.Printf("[DEBUG] driver.rkt: started ACI %q (UUID: %s) for task %q with: %v", img, uuid, d.taskName, runArgs)
+	}
+
 	maxKill := d.DriverContext.config.MaxKillTimeout
 	h := &rktHandle{
 		uuid:           uuid,
@@ -729,6 +949,36 @@ func (d *RktDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error
 	}
 	go h.run()
 	return h, nil
+}
+
+func (d *RktDriver) fetchImage(img lastditch.RuntimeImage, fetchArgs []string) (string, error) {
+	var version string
+	for _, label := range img.Labels {
+		if label.Name == "version" {
+			version = label.Value
+			break
+		}
+	}
+
+	var imgName string
+	if version == "" {
+		return "", fmt.Errorf("no version supplied for image: %s", img.Name)
+	}
+
+	imgName = fmt.Sprintf("docker://%s:%s", img.Name, version)
+	fetchArgs = append(fetchArgs, imgName)
+
+	var outBuf, errBuf bytes.Buffer
+	cmd := exec.Command("rkt", fetchArgs...)
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+
+	d.logger.Printf("[DEBUG] driver.rkt: fetching image %q for task %q with: %v", img, d.taskName, fetchArgs)
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to fetch image: %s\n\nOutput: %s\n\nError: %s", err, outBuf.String(), errBuf.String())
+	}
+
+	return strings.TrimSpace(outBuf.String()), nil
 }
 
 func (h *rktHandle) ID() string {
