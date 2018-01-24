@@ -75,7 +75,7 @@ func TestRktDriver_Fingerprint(t *testing.T) {
 	}
 }
 
-func TestRktDriver_Start_DNS(t *testing.T) {
+func TestRktDriver_Image_Start_DNS(t *testing.T) {
 	if !testutil.IsTravis() {
 		t.Parallel()
 	}
@@ -129,7 +129,81 @@ func TestRktDriver_Start_DNS(t *testing.T) {
 	handle2.Kill()
 }
 
-func TestRktDriver_Start_Wait(t *testing.T) {
+func TestRktDriver_PodManifest_Start_DNS(t *testing.T) {
+	if !testutil.IsTravis() {
+		t.Parallel()
+	}
+	if os.Getenv("NOMAD_TEST_RKT") == "" {
+		t.Skip("skipping rkt tests")
+	}
+
+	ctestutils.RktCompatible(t)
+	task := &structs.Task{
+		Name:   "etcd",
+		Driver: "rkt",
+		Config: map[string]interface{}{
+			"trust_prefix": "coreos.com/etcd",
+			"pod_manifest": `{
+				"acVersion": "1.27.0",
+				"acKind": "PodManifest",
+				"apps": [
+					{
+						"name": "coreos",
+						"image": {
+							"name": "coreos.com/etcd",
+							"labels": [
+								{
+									"name":  "version",
+									"value": "v2.0.4"
+								}
+							]
+						},
+						"app": {
+							"exec": ["/etcd"],
+							"user": "0",
+							"group": "0",
+							"environment": []
+						}
+					}
+				],
+				"isolators": null
+			}`,
+			"dns_servers":        []string{"8.8.8.8", "8.8.4.4"},
+			"dns_search_domains": []string{"example.com", "example.org", "example.net"},
+		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
+		},
+		Resources: &structs.Resources{
+			MemoryMB: 128,
+			CPU:      100,
+		},
+	}
+	ctx := testDriverContexts(t, task)
+	defer ctx.AllocDir.Destroy()
+	d := NewRktDriver(ctx.DriverCtx)
+	if _, err := d.Prestart(ctx.ExecCtx, task); err != nil {
+		t.Fatalf("error in prestart: %v", err)
+	}
+	resp, err := d.Start(ctx.ExecCtx, task)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer resp.Handle.Kill()
+
+	// Attempt to open
+	handle2, err := d.Open(ctx.ExecCtx, resp.Handle.ID())
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if handle2 == nil {
+		t.Fatalf("missing handle")
+	}
+	handle2.Kill()
+}
+
+func TestRktDriver_Image_Start_Wait(t *testing.T) {
 	if !testutil.IsTravis() {
 		t.Parallel()
 	}
@@ -203,7 +277,94 @@ func TestRktDriver_Start_Wait(t *testing.T) {
 	}
 }
 
-func TestRktDriver_Start_Wait_Skip_Trust(t *testing.T) {
+func TestRktDriver_PodManifest_Start_Wait(t *testing.T) {
+	if !testutil.IsTravis() {
+		t.Parallel()
+	}
+	if os.Getenv("NOMAD_TEST_RKT") == "" {
+		t.Skip("skipping rkt tests")
+	}
+	ctestutils.RktCompatible(t)
+	task := &structs.Task{
+		Name:   "etcd",
+		Driver: "rkt",
+		Config: map[string]interface{}{
+			"trust_prefix": "coreos.com/etcd",
+			"pod_manifest": `{
+				"acVersion": "1.27.0",
+				"acKind": "PodManifest",
+				"apps": [
+					{
+						"name": "coreos",
+						"image": {
+							"name": "coreos.com/etcd",
+							"labels": [
+								{
+									"name":  "version",
+									"value": "v2.0.4"
+								}
+							]
+						}
+					}
+				]
+			}`,
+		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
+		},
+		Resources: &structs.Resources{
+			MemoryMB: 128,
+			CPU:      100,
+		},
+	}
+	ctx := testDriverContexts(t, task)
+	defer ctx.AllocDir.Destroy()
+	d := NewRktDriver(ctx.DriverCtx)
+
+	if _, err := d.Prestart(ctx.ExecCtx, task); err != nil {
+		t.Fatalf("error in prestart: %v", err)
+	}
+	resp, err := d.Start(ctx.ExecCtx, task)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	handle := resp.Handle.(*rktHandle)
+	defer handle.Kill()
+
+	// Update should be a no-op
+	if err := handle.Update(task); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Signal should be an error
+	if err := resp.Handle.Signal(syscall.SIGTERM); err == nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	select {
+	case res := <-resp.Handle.WaitCh():
+		if !res.Successful() {
+			t.Fatalf("err: %v", res)
+		}
+	case <-time.After(time.Duration(testutil.TestMultiplier()*15) * time.Second):
+		t.Fatalf("timeout")
+	}
+
+	// Make sure pod was removed #3561
+	var stderr bytes.Buffer
+	cmd := exec.Command(rktCmd, "status", handle.uuid)
+	cmd.Stdout = ioutil.Discard
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("expected error running 'rkt status %s' on removed container", handle.uuid)
+	}
+	if out := stderr.String(); !strings.Contains(out, "no matches found") {
+		t.Fatalf("expected 'no matches found' but received: %s", out)
+	}
+}
+
+func TestRktDriver_Image_Start_Wait_Skip_Trust(t *testing.T) {
 	if !testutil.IsTravis() {
 		t.Parallel()
 	}
@@ -259,7 +420,78 @@ func TestRktDriver_Start_Wait_Skip_Trust(t *testing.T) {
 	}
 }
 
-func TestRktDriver_Start_Wait_AllocDir(t *testing.T) {
+func TestRktDriver_PodManifest_Start_Wait_Skip_Trust(t *testing.T) {
+	if !testutil.IsTravis() {
+		t.Parallel()
+	}
+	if os.Getenv("NOMAD_TEST_RKT") == "" {
+		t.Skip("skipping rkt tests")
+	}
+
+	ctestutils.RktCompatible(t)
+	task := &structs.Task{
+		Name:   "etcd",
+		Driver: "rkt",
+		Config: map[string]interface{}{
+			"pod_manifest": `{
+				"acVersion": "1.27.0",
+				"acKind": "PodManifest",
+				"apps": [
+					{
+						"name": "coreos",
+						"image": {
+							"name": "coreos.com/etcd",
+							"labels": [
+								{
+									"name":  "version",
+									"value": "v2.0.4"
+								}
+							]
+						}
+					}
+				]
+			}`,
+		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
+		},
+		Resources: &structs.Resources{
+			MemoryMB: 128,
+			CPU:      100,
+		},
+	}
+
+	ctx := testDriverContexts(t, task)
+	defer ctx.AllocDir.Destroy()
+	d := NewRktDriver(ctx.DriverCtx)
+
+	if _, err := d.Prestart(ctx.ExecCtx, task); err != nil {
+		t.Fatalf("error in prestart: %v", err)
+	}
+	resp, err := d.Start(ctx.ExecCtx, task)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer resp.Handle.Kill()
+
+	// Update should be a no-op
+	err = resp.Handle.Update(task)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	select {
+	case res := <-resp.Handle.WaitCh():
+		if !res.Successful() {
+			t.Fatalf("err: %v", res)
+		}
+	case <-time.After(time.Duration(testutil.TestMultiplier()*15) * time.Second):
+		t.Fatalf("timeout")
+	}
+}
+
+func TestRktDriver_iImage_Start_Wait_AllocDir(t *testing.T) {
 	if !testutil.IsTravis() {
 		t.Parallel()
 	}
@@ -427,7 +659,7 @@ func TestRktTrustPrefix(t *testing.T) {
 	}
 }
 
-func TestRktTaskValidate(t *testing.T) {
+func TestRktTaskValidate_Image(t *testing.T) {
 	t.Parallel()
 	ctestutils.RktCompatible(t)
 	task := &structs.Task{
@@ -450,6 +682,118 @@ func TestRktTaskValidate(t *testing.T) {
 	if err := d.Validate(task.Config); err != nil {
 		t.Fatalf("Validation error in TaskConfig : '%v'", err)
 	}
+}
+
+func TestRktTaskValidate_PodManifest(t *testing.T) {
+	t.Parallel()
+	ctestutils.RktCompatible(t)
+	task := &structs.Task{
+		Name:   "etcd",
+		Driver: "rkt",
+		Config: map[string]interface{}{
+			"trust_prefix": "coreos.com/etcd",
+			"pod_manifest": `{
+				"acVersion": "1.27.0",
+				"acKind": "PodManifest",
+				"apps": [
+					{
+						"name": "coreos",
+						"image": {
+							"name": "coreos.com/etcd",
+							"labels": [
+								{
+									"name":  "version",
+									"value": "v2.0.4"
+								}
+							]
+						}
+					}
+				]
+			}`,
+			"command":            "/etcd",
+			"args":               []string{"--version"},
+			"dns_servers":        []string{"8.8.8.8", "8.8.4.4"},
+			"dns_search_domains": []string{"example.com", "example.org", "example.net"},
+		},
+		Resources: basicResources,
+	}
+	ctx := testDriverContexts(t, task)
+	defer ctx.AllocDir.Destroy()
+	d := NewRktDriver(ctx.DriverCtx)
+
+	if err := d.Validate(task.Config); err != nil {
+		t.Fatalf("Validation error in TaskConfig : '%v'", err)
+	}
+
+}
+
+func TestRktTaskValidate_Without_PodManifest_Image(t *testing.T) {
+	t.Parallel()
+	ctestutils.RktCompatible(t)
+	task := &structs.Task{
+		Name:   "etcd",
+		Driver: "rkt",
+		Config: map[string]interface{}{
+			"trust_prefix":       "coreos.com/etcd",
+			"command":            "/etcd",
+			"args":               []string{"--version"},
+			"dns_servers":        []string{"8.8.8.8", "8.8.4.4"},
+			"dns_search_domains": []string{"example.com", "example.org", "example.net"},
+		},
+		Resources: basicResources,
+	}
+	ctx := testDriverContexts(t, task)
+	defer ctx.AllocDir.Destroy()
+	d := NewRktDriver(ctx.DriverCtx)
+
+	if err := d.Validate(task.Config); err == nil {
+		t.Fatalf("Validation error in TaskConfig : '%v'", err)
+	}
+
+}
+
+func TestRktTaskValidate_With_PodManifest_Image(t *testing.T) {
+	t.Parallel()
+	ctestutils.RktCompatible(t)
+	task := &structs.Task{
+		Name:   "etcd",
+		Driver: "rkt",
+		Config: map[string]interface{}{
+			"trust_prefix": "coreos.com/etcd",
+			"image":        "coreos.com/etcd:v2.0.4",
+			"pod_manifest": `{
+				"acVersion": "1.27.0",
+				"acKind": "PodManifest",
+				"apps": [
+					{
+						"name": "coreos",
+						"image": {
+							"name": "coreos.com/etcd",
+							"labels": [
+								{
+									"name":  "version",
+									"value": "v2.0.4"
+								}
+							]
+						}
+					}
+				]
+			}`,
+			"command":            "/etcd",
+			"args":               []string{"--version"},
+			"dns_servers":        []string{"8.8.8.8", "8.8.4.4"},
+			"dns_search_domains": []string{"example.com", "example.org", "example.net"},
+		},
+		Resources: basicResources,
+	}
+	ctx := testDriverContexts(t, task)
+	defer ctx.AllocDir.Destroy()
+	d := NewRktDriver(ctx.DriverCtx)
+
+	if err := d.Validate(task.Config); err == nil {
+		t.Fatalf("Validation error in TaskConfig : '%v'", err)
+	}
+
 }
 
 // TODO: Port Mapping test should be ran with proper ACI image and test the port access.
@@ -677,4 +1021,61 @@ func TestRktDriver_Remove_Error(t *testing.T) {
 	if err := rktRemove("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"); err == nil {
 		t.Fatalf("expected an error")
 	}
+}
+
+func TestRktDriver_PodManifest_Optional_Fields_Start(t *testing.T) {
+	// This test ensures that pod manifest can be used without the optional fields present.
+
+	if !testutil.IsTravis() {
+		t.Parallel()
+	}
+	if os.Getenv("NOMAD_TEST_RKT") == "" {
+		t.Skip("skipping rkt tests")
+	}
+
+	ctestutils.RktCompatible(t)
+	task := &structs.Task{
+		Name:   "etcd",
+		Driver: "rkt",
+		Config: map[string]interface{}{
+			"trust_prefix": "coreos.com/etcd",
+			"pod_manifest": `{
+				"acVersion": "1.27.0",
+				"acKind": "PodManifest",
+				"apps": [
+					{
+						"name": "coreos",
+						"image": {
+							"name": "coreos.com/etcd",
+							"labels": [
+								{
+									"name":  "version",
+									"value": "v2.0.4"
+								}
+							]
+						}
+					}
+				]
+			}`,
+		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
+		},
+		Resources: &structs.Resources{
+			MemoryMB: 128,
+			CPU:      100,
+		},
+	}
+	ctx := testDriverContexts(t, task)
+	defer ctx.AllocDir.Destroy()
+	d := NewRktDriver(ctx.DriverCtx)
+	if _, err := d.Prestart(ctx.ExecCtx, task); err != nil {
+		t.Fatalf("error in prestart: %v", err)
+	}
+	resp, err := d.Start(ctx.ExecCtx, task)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	resp.Handle.Kill()
 }
