@@ -3,6 +3,7 @@
 	"ignore": "test appengine",
 	"package": [
 		{"path":"context","revision":""},
+		{"path":"githbu.com/appc/spec","revision":""},
 		{"path":"github.com/Azure/go-ansiterm","checksumSHA1":"23FJUX+AInYeEM2hoUMvYZtXZd4=","revision":"fa152c58bc15761d0200cb75fe958b89a9d4888e","revisionTime":"2016-06-22T17:32:16Z"},
 		{"path":"github.com/Azure/go-ansiterm/winterm","checksumSHA1":"jBimnggjIiFUjaImNoJhSVLtdzw=","revision":"fa152c58bc15761d0200cb75fe958b89a9d4888e","revisionTime":"2016-06-22T17:32:16Z"},
 		{"path":"github.com/DataDog/datadog-go/statsd","checksumSHA1":"WvApwvvSe3i/3KO8300dyeFmkbI=","revision":"b10af4b12965a1ad08d164f57d14195b4140d8de","revisionTime":"2017-08-09T10:47:06Z"},
@@ -12,8 +13,9 @@
 		{"path":"github.com/RackSec/srslog","checksumSHA1":"OTN4c1F0p+mEG2CpkU1Kuavupf0=","revision":"259aed10dfa74ea2961eddd1d9847619f6e98837","revisionTime":"2016-01-20T22:33:50Z"},
 		{"path":"github.com/Sirupsen/logrus","comment":"v0.8.7-87-g4b6ea73","revision":"4b6ea7319e214d98c938f12692336f7ca9348d6b"},
 		{"path":"github.com/StackExchange/wmi","checksumSHA1":"qtjd74+bErubh+qyv3s+lWmn9wc=","revision":"ea383cf3ba6ec950874b8486cd72356d007c768f","revisionTime":"2017-04-10T19:29:09Z"},
-		{"path":"github.com/appc/spec/schema","checksumSHA1":"uWJDTv0R/NJVYv51LVy6vKP1CZw=","revision":"cbe99b7160b1397bf89f9c8bb1418f69c9424049","revisionTime":"2017-09-19T09:55:19Z"},
+		{"path":"github.com/appc/spec/schema","checksumSHA1":"bqIsFbIkjjS17KU1/sbNXCtLKS8=","revision":"259c2eebc32df77c016974d5e8eed390d5a81500","revisionTime":"2018-01-24T15:52:24Z"},
 		{"path":"github.com/appc/spec/schema/common","checksumSHA1":"Q47G6996hbfQaNp/8CFkGWTVQpw=","revision":"cbe99b7160b1397bf89f9c8bb1418f69c9424049","revisionTime":"2017-09-19T09:55:19Z"},
+		{"path":"github.com/appc/spec/schema/lastditch","checksumSHA1":"pAFdOs1eM1NPuDvK4liRRUwE86A=","revision":"259c2eebc32df77c016974d5e8eed390d5a81500","revisionTime":"2018-01-24T15:52:24Z"},
 		{"path":"github.com/appc/spec/schema/types","checksumSHA1":"kYXCle7Ikc8WqiMs7NXz99bUWqo=","revision":"cbe99b7160b1397bf89f9c8bb1418f69c9424049","revisionTime":"2017-09-19T09:55:19Z"},
 		{"path":"github.com/appc/spec/schema/types/resource","checksumSHA1":"VgPsPj5PH7LKXMa3ZLe5/+Avydo=","revision":"cbe99b7160b1397bf89f9c8bb1418f69c9424049","revisionTime":"2017-09-19T09:55:19Z"},
 		{"path":"github.com/armon/circbuf","revision":"bbbad097214e2918d8543d5201d12bfd7bca254d"},
