@@ -1047,8 +1047,11 @@ func (h *rktHandle) Stats() (*cstructs.TaskResourceUsage, error) {
 }
 
 func (h *rktHandle) run() {
+	h.logger.Printf("Waiting for executor")
 	ps, werr := h.executor.Wait()
+	h.logger.Printf("Executor returned, closing doneCh")
 	close(h.doneCh)
+	h.logger.Printf("donech closed")
 	if ps.ExitCode == 0 && werr != nil {
 		if e := killProcess(h.executorPid); e != nil {
 			h.logger.Printf("[ERR] driver.rkt: error killing user process: %v", e)
@@ -1062,11 +1065,13 @@ func (h *rktHandle) run() {
 	h.pluginClient.Kill()
 
 	// Remove the pod
+	h.logger.Printf("Running rktRemove")
 	if err := rktRemove(h.uuid); err != nil {
 		h.logger.Printf("[ERR] driver.rkt: error removing pod %q - must gc manually: %v", h.uuid, err)
 	} else {
 		h.logger.Printf("[DEBUG] driver.rkt: removed pod %q", h.uuid)
 	}
+	h.logger.Printf("Finished rktRemove")
 
 	// Send the results
 	h.waitCh <- dstructs.NewWaitResult(ps.ExitCode, 0, werr)
