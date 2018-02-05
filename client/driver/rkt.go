@@ -97,17 +97,18 @@ type RktDriverConfig struct {
 
 // rktHandle is returned from Start/Open as a handle to the PID
 type rktHandle struct {
-	uuid           string
-	env            *env.TaskEnv
-	taskDir        *allocdir.TaskDir
-	pluginClient   *plugin.Client
-	executorPid    int
-	executor       executor.Executor
-	logger         *log.Logger
-	killTimeout    time.Duration
-	maxKillTimeout time.Duration
-	waitCh         chan *dstructs.WaitResult
-	doneCh         chan struct{}
+	uuid            string
+	env             *env.TaskEnv
+	taskDir         *allocdir.TaskDir
+	pluginClient    *plugin.Client
+	executorPid     int
+	executor        executor.Executor
+	logger          *log.Logger
+	killTimeout     time.Duration
+	maxKillTimeout  time.Duration
+	waitCh          chan *dstructs.WaitResult
+	doneCh          chan struct{}
+	podManifestApps appcAppList // Added as a way to get podManifest apps in the Exec function from the Start function
 }
 
 // rktPID is a struct to map the pid running the process to the vm image on
@@ -748,8 +749,12 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse,
 
 		// pod manifest is set here
 		prepareArgs = append(prepareArgs, fmt.Sprintf("--pod-manifest=%s", podManifestTmpfile))
+	} else {
+		// If a user has been specified for the task, pass it through to the user
+		if task.User != "" {
+			prepareArgs = append(prepareArgs, fmt.Sprintf("--user=%s", task.User))
+		}
 	}
-
 	// Add user passed arguments.
 	if len(driverConfig.Args) != 0 {
 		parsed := ctx.TaskEnv.ParseAndReplace(driverConfig.Args)
@@ -836,17 +841,18 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse,
 
 	maxKill := d.DriverContext.config.MaxKillTimeout
 	h := &rktHandle{
-		uuid:           uuid,
-		env:            rktEnv,
-		taskDir:        ctx.TaskDir,
-		pluginClient:   pluginClient,
-		executor:       execIntf,
-		executorPid:    ps.Pid,
-		logger:         d.logger,
-		killTimeout:    GetKillTimeout(task.KillTimeout, maxKill),
-		maxKillTimeout: maxKill,
-		doneCh:         make(chan struct{}),
-		waitCh:         make(chan *dstructs.WaitResult, 1),
+		uuid:            uuid,
+		env:             rktEnv,
+		taskDir:         ctx.TaskDir,
+		pluginClient:    pluginClient,
+		executor:        execIntf,
+		executorPid:     ps.Pid,
+		logger:          d.logger,
+		killTimeout:     GetKillTimeout(task.KillTimeout, maxKill),
+		maxKillTimeout:  maxKill,
+		doneCh:          make(chan struct{}),
+		waitCh:          make(chan *dstructs.WaitResult, 1),
+		podManifestApps: podManifest.Apps,
 	}
 	go h.run()
 
@@ -1029,11 +1035,23 @@ func (h *rktHandle) Exec(ctx context.Context, cmd string, args []string) ([]byte
 		return nil, 0, fmt.Errorf("unable to find rkt pod UUID")
 	}
 	// enter + UUID + cmd + args...
-	enterArgs := make([]string, 3+len(args))
+	// but if we have pod manifest with multiple apps it becomes
+	// enter + --<app=appname> + UUID + cmd + args...
+	enterArgs := make([]string, 4+len(args))
 	enterArgs[0] = "enter"
-	enterArgs[1] = h.uuid
-	enterArgs[2] = cmd
-	copy(enterArgs[3:], args)
+	// If we have multiple pod manifest, use the first app
+	// TO DO: Rather than using the first app in the pod manifest by default,
+	// let the required app's name be passed in.
+	if len(h.podManifestApps) > 1 {
+		enterArgs[1] = fmt.Sprintf("--app=%s", h.podManifestApps[0].Name)
+		enterArgs[2] = h.uuid
+		enterArgs[3] = cmd
+		copy(enterArgs[4:], args)
+	} else {
+		enterArgs[1] = h.uuid
+		enterArgs[2] = cmd
+		copy(enterArgs[3:], args)
+	}
 	return executor.ExecScript(ctx, h.taskDir.Dir, h.env, nil, rktCmd, enterArgs)
 }
 
